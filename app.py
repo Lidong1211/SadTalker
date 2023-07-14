@@ -23,7 +23,7 @@ tmp_root_path = "./tmp"
 os.makedirs(tmp_root_path, exist_ok=True)
 
 
-@app.route('/api/buildVideo', methods=['POST'])
+@app.route('/api/video/build', methods=['POST'])
 def build_video():
     # 验证POST请求的数据
     if 'driven_audio' not in request.files:
@@ -36,20 +36,21 @@ def build_video():
     task_queue.put(args)
     task_id = args.task_id
     task_id_list.append(task_id)
-    print(task_id)
     # 返回处理结果
     return jsonify({'task_id': task_id})
 
 
-@app.route('/api/getVideo', methods=['GET'])
+@app.route('/api/video/get', methods=['GET'])
 def get_video():
     task_id = request.args.get('task_id')
 
     if task_id in task_id_list:
         # 返回 task_id 在 task_id_list 中的索引位置
         index = task_id_list.index(task_id)
-        return jsonify({'index': index + 1, "total": len(task_id_list)})
-
+        if(index == 0):
+            return jsonify({'status': 'processing', 'index': index + 1, "total": len(task_id_list)})
+        else:
+            return jsonify({'status': 'waiting', 'index': index + 1, "total": len(task_id_list)})
     video_path = f'{tmp_root_path}/{task_id}/result.mp4'
     if os.path.isfile(video_path):
         # 使用 send_file 函数返回视频文件
@@ -215,6 +216,7 @@ def generate(args):
 
     if not args.verbose:
         shutil.rmtree(save_dir)
+
 
 
 # 创建视频生成任务start
