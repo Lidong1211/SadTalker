@@ -5,6 +5,7 @@ import queue
 import threading
 import types
 import shutil
+import traceback
 from flask import Flask, jsonify, request, send_file
 from src.utils.preprocess import CropAndExtract
 from src.test_audio2coeff import Audio2Coeff
@@ -47,7 +48,7 @@ def get_video():
     if task_id in task_id_list:
         # 返回 task_id 在 task_id_list 中的索引位置
         index = task_id_list.index(task_id)
-        if(index == 0):
+        if (index == 0):
             return jsonify({'status': 'processing', 'index': index + 1, "total": len(task_id_list)})
         else:
             return jsonify({'status': 'waiting', 'index': index + 1, "total": len(task_id_list)})
@@ -107,7 +108,6 @@ def build_common_args(args):
     args["still"] = bool(True)
     # preprocess: default crop ['crop', 'extcrop', 'resize', 'full', 'extfull']
     args["preprocess"] = 'full'
-    args["verbose"] = bool(False)
     args["old_version"] = bool(False)
 
     # net structure and parameters
@@ -134,89 +134,95 @@ def build_common_args(args):
 
 
 def generate(args):
-    pic_path = args.source_image
-    audio_path = args.driven_audio
     save_dir = os.path.join(args.tmp_path, "result")
     os.makedirs(save_dir, exist_ok=True)
-    pose_style = args.pose_style
-    device = args.device
-    batch_size = args.batch_size
-    input_yaw_list = args.input_yaw
-    input_pitch_list = args.input_pitch
-    input_roll_list = args.input_roll
-    ref_eyeblink = args.ref_eyeblink
-    ref_pose = args.ref_pose
+    image_path = args.source_image
+    audio_path = args.driven_audio
+    checkpoint_dir = args.checkpoint_dir
+    enhancer = args.enhancer  # Face enhancer, [gfpgan, RestoreFormer]
+    still = args.still  # can crop back to the original videos for the full body aniamtion
+    preprocess = args.preprocess  # ['crop', 'extcrop', 'resize', 'full', 'extfull'] [default 'crop']
+    ref_eye_blink = args.ref_eyeblink  # path to reference video providing eye blinking
+    ref_pose = args.ref_pose  # path to reference video providing pose
+    pose_style = args.pose_style  # input pose style from [0, 46)  [default 0]
+    device = args.device  # cuda / cpu
+    input_yaw_list = args.input_yaw  # the input yaw degree of the user
+    input_pitch_list = args.input_pitch  # the input pitch degree of the user
+    input_roll_list = args.input_roll  # the input roll degree of the user
+    img_size = args.size  # the image size of the face_render [default 256]
+    batch_size = args.batch_size  # the batch size of face_render [default 2]
+    expression_scale = args.expression_scale  # the batch size of face_render [default 1.]
+    background_enhancer = args.background_enhancer  # background enhancer, [realesrgan] [default None]
+    old_version = args.old_version  # use the pth other than safetensor version
 
     current_root_path = os.path.split(sys.argv[0])[0]
 
-    sadtalker_paths = init_path(args.checkpoint_dir, os.path.join(current_root_path, 'src/config'), args.size,
-                                args.old_version, args.preprocess)
+    # init config [wav2lip、audio2pose、audio2exp、freeView、BFM、mapping、face_render等]
+    config_dir = os.path.join(current_root_path, 'src/config')
+    sadtalker_paths = init_path(checkpoint_dir, config_dir, img_size, old_version, preprocess)
 
-    # init model
+    # init model [预处理]
     preprocess_model = CropAndExtract(sadtalker_paths, device)
+    # init model [音频->系数]
+    audio_to_coefficient_model = Audio2Coeff(sadtalker_paths, device)
+    # init model [系数->动画]
+    animate_from_coefficient_model = AnimateFromCoeff(sadtalker_paths, device)
 
-    audio_to_coeff = Audio2Coeff(sadtalker_paths, device)
-
-    animate_from_coeff = AnimateFromCoeff(sadtalker_paths, device)
-
+    # [预处理] 裁剪图像并从中提取3DMM
     # crop image and extract 3dmm from image
-    first_frame_dir = os.path.join(save_dir, 'first_frame_dir')
-    os.makedirs(first_frame_dir, exist_ok=True)
     print('3DMM Extraction for source image')
-    first_coeff_path, crop_pic_path, crop_info = preprocess_model.generate(pic_path, first_frame_dir, args.preprocess, \
-                                                                           source_image_flag=True, pic_size=args.size)
-    if first_coeff_path is None:
-        print("Can't get the coeffs of the input")
+    image_frame_dir = os.path.join(save_dir, 'image_frame_dir')
+    os.makedirs(image_frame_dir, exist_ok=True)
+    image_coefficient_path, crop_pic_path, crop_info = preprocess_model.generate(image_path, image_frame_dir,
+                                                                                 preprocess, True, img_size)
+    if image_coefficient_path is None:
+        print("Can't get the coefficient of the input source image")
         return
 
-    if ref_eyeblink is not None:
-        ref_eyeblink_videoname = os.path.splitext(os.path.split(ref_eyeblink)[-1])[0]
-        ref_eyeblink_frame_dir = os.path.join(save_dir, ref_eyeblink_videoname)
-        os.makedirs(ref_eyeblink_frame_dir, exist_ok=True)
+    # [预处理] 眨眼参考视频的3DMM提取
+    if ref_eye_blink is not None:
+        ref_eye_blink_video_name = os.path.splitext(os.path.split(ref_eye_blink)[-1])[0]
+        ref_eye_blink_frame_dir = os.path.join(save_dir, ref_eye_blink_video_name)
+        os.makedirs(ref_eye_blink_frame_dir, exist_ok=True)
         print('3DMM Extraction for the reference video providing eye blinking')
-        ref_eyeblink_coeff_path, _, _ = preprocess_model.generate(ref_eyeblink, ref_eyeblink_frame_dir, args.preprocess,
-                                                                  source_image_flag=False)
+        eye_blink_coefficient_path, _, _ = preprocess_model.generate(ref_eye_blink, ref_eye_blink_frame_dir, preprocess,
+                                                                     False)
     else:
-        ref_eyeblink_coeff_path = None
+        eye_blink_coefficient_path = None
 
-    if ref_pose is not None:
-        if ref_pose == ref_eyeblink:
-            ref_pose_coeff_path = ref_eyeblink_coeff_path
-        else:
-            ref_pose_videoname = os.path.splitext(os.path.split(ref_pose)[-1])[0]
-            ref_pose_frame_dir = os.path.join(save_dir, ref_pose_videoname)
-            os.makedirs(ref_pose_frame_dir, exist_ok=True)
-            print('3DMM Extraction for the reference video providing pose')
-            ref_pose_coeff_path, _, _ = preprocess_model.generate(ref_pose, ref_pose_frame_dir, args.preprocess,
-                                                                  source_image_flag=False)
+    # [预处理] 姿势的参考视频的3DMM提取
+    if ref_pose == ref_eye_blink:
+        pose_coefficient_path = eye_blink_coefficient_path
+    elif ref_pose is not None:
+        ref_pose_video_name = os.path.splitext(os.path.split(ref_pose)[-1])[0]
+        ref_pose_frame_dir = os.path.join(save_dir, ref_pose_video_name)
+        os.makedirs(ref_pose_frame_dir, exist_ok=True)
+        print('3DMM Extraction for the reference video providing pose')
+        pose_coefficient_path, _, _ = preprocess_model.generate(ref_pose, ref_pose_frame_dir, preprocess, False)
     else:
-        ref_pose_coeff_path = None
+        pose_coefficient_path = None
 
-    # audio2ceoff
-    batch = get_data(first_coeff_path, audio_path, device, ref_eyeblink_coeff_path, still=args.still)
-    coeff_path = audio_to_coeff.generate(batch, save_dir, pose_style, ref_pose_coeff_path)
+    # [音频->系数]
+    batch = get_data(image_coefficient_path, audio_path, device, eye_blink_coefficient_path, still)
+    all_coefficient = audio_to_coefficient_model.generate(batch, save_dir, pose_style, pose_coefficient_path)
 
-    # 3dface render
+    # [3D Face Render]
     if args.face3dvis:
         from src.face3d.visualize import gen_composed_video
-        gen_composed_video(args, device, first_coeff_path, coeff_path, audio_path, os.path.join(save_dir, '3dface.mp4'))
+        face3d_path = os.path.join(save_dir, '3dface.mp4')
+        gen_composed_video(args, device, image_coefficient_path, all_coefficient, audio_path, face3d_path)
 
-    # coeff2video
-    data = get_facerender_data(coeff_path, crop_pic_path, first_coeff_path, audio_path,
-                               batch_size, input_yaw_list, input_pitch_list, input_roll_list,
-                               expression_scale=args.expression_scale, still_mode=args.still,
-                               preprocess=args.preprocess, size=args.size)
+    # [系数->动画]
+    face_render_data = get_facerender_data(all_coefficient, crop_pic_path, image_coefficient_path, audio_path,
+                                           batch_size, input_yaw_list, input_pitch_list, input_roll_list,
+                                           expression_scale, still, preprocess, img_size)
+    result = animate_from_coefficient_model.generate(face_render_data, save_dir, image_path, crop_info,
+                                                     enhancer, background_enhancer, preprocess, img_size)
 
-    result = animate_from_coeff.generate(data, save_dir, pic_path, crop_info, \
-                                         enhancer=args.enhancer, background_enhancer=args.background_enhancer,
-                                         preprocess=args.preprocess, img_size=args.size)
-
-    shutil.move(result, save_dir + '.mp4')
-    print('The generated video is named:', save_dir + '.mp4')
-
-    if not args.verbose:
-        shutil.rmtree(save_dir)
-
+    # 保存文件
+    save_video_name = save_dir + '.mp4'
+    shutil.move(result, save_video_name)
+    print('The generated video is named:', save_video_name)
 
 
 # 创建视频生成任务start
@@ -233,7 +239,8 @@ def generate_video_task():
             pass
         except Exception as e:
             # 处理其他异常
-            print("Exception occurred:", e)
+            print("task(" + args.task_id + ") build video exception")
+            traceback.print_exc()
         finally:
             if args is not None:
                 task_id_list.remove(args.task_id)
