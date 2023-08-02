@@ -5,6 +5,14 @@ import queue
 import types
 import shutil
 import traceback
+import re
+
+from moviepy.video.compositing.concatenate import concatenate_videoclips
+from moviepy.video.io.VideoFileClip import VideoFileClip
+from pydub import AudioSegment
+from pydub.silence import split_on_silence
+
+import config
 from src.utils.preprocess import CropAndExtract
 from src.test_audio2coeff import Audio2Coeff
 from src.facerender.animate import AnimateFromCoeff
@@ -16,15 +24,6 @@ from app.args_utils import build_common_args
 # 创建一个队列
 task_queue = queue.Queue()
 task_id_list = []
-# tmp文件夹
-tmp_root_path = "./tmp"
-
-
-def get_tmp_root_path():
-    if os.path.isabs(tmp_root_path):
-        return tmp_root_path
-    else:
-        return os.path.join(os.path.dirname(__file__), "..", tmp_root_path)
 
 
 def add_task(args):
@@ -47,11 +46,92 @@ def index_of_task_id_list(task_id):
     return -1, len(task_id_list)
 
 
-def __generate(args):
+def _generate_split(args):
+    task_tmp_dir = args.tmp_path
+    audio_path = args.driven_audio
+    split_audio_dir = f"{task_tmp_dir}/audio_split/"
+    split_video_dir = f"{task_tmp_dir}/video_split/"
+
+    # 如果没有视频片段生成，则切分音频
+    if not os.path.exists(split_video_dir):
+        split_audio(audio_path, split_audio_dir)
+
+    # 获取最后一个生成的视频片段(使用正则表达式匹配以数字命名的文件名，并获取最大的数字)
+    os.makedirs(split_video_dir, exist_ok=True)
+    pattern = r'^video_(\d+)\.mp4'
+    number_list = [int(re.match(pattern, file_name).group(1)) for file_name in os.listdir(split_video_dir) if
+                   re.match(pattern, file_name)]
+    max_number = max(number_list) if number_list else 0
+
+    # 继续生成视频
+    index = max_number + 1
+    split_audio_file = f"{split_audio_dir}audio_" + str(index) + ".wav"
+    while os.path.exists(split_audio_file):
+        args.save_dir = f"{split_video_dir}video_" + str(index)
+        args.driven_audio = split_audio_file
+        # 重试3次逻辑
+        retry_count = 0
+        while retry_count < 3:
+            try:
+                _generate(args)
+                break
+            except Exception as e:
+                print(f"Failed to generate video: {e}")
+                retry_count += 1
+        else:
+            # 如果重试3次后仍然失败，抛出异常
+            raise Exception("Failed to generate video after 3 attempts")
+        index += 1
+        split_audio_file = f"{split_audio_dir}audio_" + str(index) + ".wav"
+
+    # 拼接所有视频
+    final_video_file = os.path.join(task_tmp_dir, "result.mp4")
+    video_files = [file for file in os.listdir(split_video_dir) if file.endswith(".mp4")]
+    sorted_video_files = sorted(video_files, key=lambda x: int(re.match(r'video_(\d+)\.mp4', x).group(1)))
+    clips = [VideoFileClip(os.path.join(split_video_dir, video)) for video in sorted_video_files]
+    final_clip = concatenate_videoclips(clips, method="compose")
+    final_clip.write_videofile(final_video_file)
+
+
+def split_audio(input_path: str, split_audio_dir: str):
+    """
+    按每句话切分音频
+    Args:
+        input_path:
+        split_audio_dir:
+
+    Returns:
+
+    """
+    shutil.rmtree(split_audio_dir, True)
+    os.makedirs(split_audio_dir, exist_ok=True)
+    # 加载音频文件
+    audio = AudioSegment.from_file(input_path)
+    # 定义静默阈值（声音强度低于该值被认为是空白）
+    silence_threshold = -50  # 根据实际情况调整
+    # 检测音频中的空白段和非空白段
+    segments = split_on_silence(audio, silence_thresh=silence_threshold, keep_silence=True)
+    index = 1
+    # 保存静默段和非静默段
+    for i, segment in enumerate(segments):
+        if len(segment) > 10000:  # 10秒的毫秒数
+            # 如果段超过10秒，按10秒每段切分
+            split_segments = [segment[j:j + 10000] for j in range(0, len(segment), 10000)]
+            for k, split_segment in enumerate(split_segments):
+                output_file = f"{split_audio_dir}audio_{index}.wav"
+                split_segment.export(output_file, format="wav")
+                index += 1
+        else:
+            output_file = f"{split_audio_dir}audio_{index}.wav"
+            segment.export(output_file, format="wav")
+            index += 1
+
+
+def _generate(args):
     """
     生成视频
     """
-    save_dir = os.path.join(args.tmp_path, "result")
+    save_dir = args.save_dir
     os.makedirs(save_dir, exist_ok=True)
     image_path = args.source_image
     audio_path = args.driven_audio
@@ -152,7 +232,7 @@ def generate_video_task():
             # 执行视频生成
             if args is not None:
                 print("start build " + args.task_id + " video")
-                __generate(args)
+                _generate_split(args)
         except queue.Empty:
             pass
         except BaseException as e:
@@ -176,8 +256,8 @@ def delete_old_folders_task(app):
         try:
             current_time = time.time()
             with app.app_context():
-                for folder_name in os.listdir(tmp_root_path):
-                    folder_full_path = os.path.join(tmp_root_path, folder_name)
+                for folder_name in os.listdir(config.TMP_PATH):
+                    folder_full_path = os.path.join(config.TMP_PATH, folder_name)
                     if os.path.isdir(folder_full_path) and current_time - os.path.getctime(
                             folder_full_path) > 24 * 60 * 60:
                         shutil.rmtree(folder_full_path)
@@ -195,7 +275,7 @@ def delete_old_folders_task(app):
 # 历史任务初始化start
 def submit_task(task_id):
     # 将任务ID提交到队列中的代码
-    task_tmp_path = os.path.join(tmp_root_path, task_id)
+    task_tmp_path = os.path.join(config.TMP_PATH, task_id)
     args = {
         "task_id": task_id,
         "tmp_path": task_tmp_path,
@@ -227,6 +307,7 @@ def _get_source_image_path(folder_path):
 
 def loading_old_task():
     print("loading old task start...")
+    tmp_root_path = config.TMP_PATH
     for folder_name in sorted(os.listdir(tmp_root_path),
                               key=lambda x: os.path.getctime(os.path.join(tmp_root_path, x))):
         folder_full_path = os.path.join(tmp_root_path, folder_name)

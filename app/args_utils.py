@@ -1,7 +1,9 @@
 import os, uuid, types, torch
 
+import config
 
-def build_args(req, tmp_root_path):
+
+def build_args(req):
     """
     解析转换请求参数
     """
@@ -10,7 +12,7 @@ def build_args(req, tmp_root_path):
     driven_audio = req.files['driven_audio']
     source_image = req.files['source_image']
     # 创建保存文件的目录，并保存文件
-    tmp_path = os.path.join(tmp_root_path, task_id)
+    tmp_path = os.path.join(config.TMP_PATH, task_id)
     os.makedirs(tmp_path, exist_ok=True)
     driven_audio_path = os.path.join(tmp_path, "driven_audio" + os.path.splitext(driven_audio.filename)[1])
     source_image_path = os.path.join(tmp_path, "source_image" + os.path.splitext(source_image.filename)[1])
